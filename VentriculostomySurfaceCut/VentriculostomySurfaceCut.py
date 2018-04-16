@@ -141,6 +141,7 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
     self.inputNasionSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
     self.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
+    self.outCutModelSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
 
     self.logic = VentriculostomySurfaceCutLogic()
     # Add vertical spacer
@@ -151,11 +152,12 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
 
   def onReload(self, moduleName="VentriculostomySurfaceCut"):
     self.cleanup()
+    globals()[moduleName] = slicer.util.reloadScriptedModule(moduleName)
+    self.logic = VentriculostomySurfaceCutLogic()
 
   def cleanup(self):
     self.logic.coronalReferenceCurveManager.clear()
     self.logic.sagittalReferenceCurveManager.clear()
-    self.logic = VentriculostomySurfaceCutLogic()
     pass
 
   def onSelect(self):
@@ -488,13 +490,14 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     dilateFilter.SetBackgroundValue(0)
     dilateFilter.SetForegroundValue(1)
     dilatedImage = dilateFilter.Execute(paddedImage)
-    dilatedImage_ori = vtk.vtkImageData()
-    dilatedImage_ori.DeepCopy(dilatedImage)
+    #dilatedImage_ori = vtk.vtkImageData(dilatedImage)
     erodeFilter = sitk.BinaryErodeImageFilter()
     erodeFilter.SetKernelRadius([5, 5, 3])
     erodeFilter.SetBackgroundValue(0)
     erodeFilter.SetForegroundValue(1)
     erodedImage = erodeFilter.Execute(dilatedImage)
+    #subtractionFilter = sitk.SubtractImageFilter()
+    #subtractedImage = subtractionFilter.Execute(dilatedImage_ori, erodedImage)
     fillHoleFilter = sitk.BinaryFillholeImageFilter()
     holefilledImage = fillHoleFilter.Execute(erodedImage)
     holefilledImageNode = sitkUtils.PushToSlicer(holefilledImage, "holefilledImage", 0, False)
@@ -553,7 +556,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       decimator.SplittingOff()
       decimator.PreserveTopologyOn()
       decimator.SetMaximumError(1)
-      decimator.SetTargetReduction(0.5)  # 0.001 only reduce the points by 0.1%, 0.5 is 50% off
+      decimator.SetTargetReduction(0.001)  # 0.001 only reduce the points by 0.1%, 0.5 is 50% off
       decimator.ReleaseDataFlagOff()
       decimator.Update()
       smootherPoly = vtk.vtkSmoothPolyDataFilter()
@@ -594,7 +597,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       outputModelNode.SetAttribute("vtkMRMLModelNode.modelCreated", "True")
       outputModelNode.GetDisplayNode().SetVisibility(1)
       outputModelNode.GetDisplayNode().SetOpacity(0.2)
-
+      return
 
   def createTrueSagittalPlane(self, nasionNode):
       if nasionNode.GetNumberOfFiducials():
@@ -628,15 +631,26 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       clipper.SetInputData(inputModelNode.GetPolyData())
       clipper.InsideOutOn()
       clipper.Update()
-      outputModelNode.SetAndObservePolyData(clipper.GetOutput())
+      outputPoly = clipper.GetOutput()
       outputModelNode.CreateDefaultDisplayNodes()
       outputModelNode.SetAttribute("vtkMRMLModelNode.modelCreated", "True")
       outputModelNode.GetDisplayNode().SetVisibility(1)
       outputModelNode.GetDisplayNode().SetOpacity(0.6)
-      self.generateKocherNav(inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode)
+      self.generateKocherNav(inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength)
+      appendFilter = vtk.vtkAppendPolyData()
+      appendFilter.AddInputData(clipper.GetOutput())
+      appendFilter.AddInputData(self.sagittalReferenceCurveManager._curveModel.GetPolyData())
+      appendFilter.Update()
+      outputPoly.DeepCopy(appendFilter.GetOutput())
+      appendFilter.RemoveAllInputs()
+      appendFilter.AddInputData(outputPoly)
+      appendFilter.AddInputData(self.coronalReferenceCurveManager._curveModel.GetPolyData())
+      appendFilter.Update()
+      outputModelNode.SetAndObservePolyData(appendFilter.GetOutput())
+      appendFilter.RemoveAllInputs()
     pass
 
-  def generateKocherNav(self, inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode):
+  def generateKocherNav(self, inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength):
     polyData = inputModelNode.GetPolyData()
     self.createTrueSagittalPlane(nasionNode)
     if polyData and self.trueSagittalPlane and nasionNode.GetNumberOfMarkups() > 0:
@@ -654,6 +668,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
         coronalPlane = vtk.vtkPlane()
         coronalPlane.SetOrigin(posNasionBack100[0], posNasionBack100[1], posNasionBack100[2])
         coronalPlane.SetNormal(math.sin(self.sagittalYawAngle), -math.cos(self.sagittalYawAngle), 0)
+        coronalPoints.InsertNextPoint(posNasionBack100)
         self.getIntersectPoints(polyData, coronalPlane, posNasionBack100, coronalReferenceLength, 1, coronalPoints)
 
         ## Sorting
