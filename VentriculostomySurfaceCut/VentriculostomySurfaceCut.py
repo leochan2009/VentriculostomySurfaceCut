@@ -153,7 +153,6 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
   def onReload(self, moduleName="VentriculostomySurfaceCut"):
     self.cleanup()
     globals()[moduleName] = slicer.util.reloadScriptedModule(moduleName)
-    self.logic = VentriculostomySurfaceCutLogic()
 
   def cleanup(self):
     self.logic.coronalReferenceCurveManager.clear()
@@ -169,7 +168,7 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.logic.createModel(self.inputSelector.currentNode(), self.outputSelector.currentNode(), imageThreshold)
 
   def onCutSurface(self):
-    self.logic.cutSurface(self.outputSelector.currentNode(), self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outCutModelSelector.currentNode())
+    self.logic.cutSurface(self.logic.holefilledImageNode, self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outCutModelSelector.currentNode())
 
 #
 # VentriculostomySurfaceCutLogic
@@ -442,6 +441,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     self.trueSagittalPlane = None
     self.useLeftHemisphere = False
     self.sagittalYawAngle = 0.0
+    self.holefilledImageNode = None
 
   def hasImageData(self,volumeNode):
     """This is an example logic method that
@@ -473,36 +473,36 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
   def createModel(self, ventricleVolume, outputModelNode, thresholdValue):
     resampleFilter = sitk.ResampleImageFilter()
     ventricleImage = sitk.Cast(sitkUtils.PullFromSlicer(ventricleVolume.GetID()), sitk.sitkInt16)
-    samplingFactor = 2
+    samplingFactor = 1
     resampleFilter.SetSize(numpy.array(ventricleImage.GetSize()) / samplingFactor)
     resampleFilter.SetOutputSpacing(numpy.array(ventricleImage.GetSpacing()) * samplingFactor)
     resampleFilter.SetOutputDirection(ventricleImage.GetDirection())
     resampleFilter.SetOutputOrigin(numpy.array(ventricleImage.GetOrigin()))
     resampledImage = resampleFilter.Execute(ventricleImage)
     thresholdFilter = sitk.BinaryThresholdImageFilter()
-    thresholdImage = thresholdFilter.Execute(resampledImage, thresholdValue, 10000, 1, 0)
+    thresholdImage = thresholdFilter.Execute(resampledImage, thresholdValue, 10000, 0, 1)
     padFilter = sitk.ConstantPadImageFilter()
     padFilter.SetPadLowerBound([10, 10, 10])
     padFilter.SetPadUpperBound([10, 10, 10])
     paddedImage = padFilter.Execute(thresholdImage)
     dilateFilter = sitk.BinaryDilateImageFilter()
     dilateFilter.SetKernelRadius([7, 7, 5])
-    dilateFilter.SetBackgroundValue(0)
-    dilateFilter.SetForegroundValue(1)
+    dilateFilter.SetBackgroundValue(1)
+    dilateFilter.SetForegroundValue(0)
     dilatedImage = dilateFilter.Execute(paddedImage)
     #dilatedImage_ori = vtk.vtkImageData(dilatedImage)
     erodeFilter = sitk.BinaryErodeImageFilter()
     erodeFilter.SetKernelRadius([5, 5, 3])
-    erodeFilter.SetBackgroundValue(0)
-    erodeFilter.SetForegroundValue(1)
+    erodeFilter.SetBackgroundValue(1)
+    erodeFilter.SetForegroundValue(0)
     erodedImage = erodeFilter.Execute(dilatedImage)
     #subtractionFilter = sitk.SubtractImageFilter()
     #subtractedImage = subtractionFilter.Execute(dilatedImage_ori, erodedImage)
     fillHoleFilter = sitk.BinaryFillholeImageFilter()
     holefilledImage = fillHoleFilter.Execute(erodedImage)
-    holefilledImageNode = sitkUtils.PushToSlicer(holefilledImage, "holefilledImage", 0, False)
-    if holefilledImageNode:
-      holefilledImageData = holefilledImageNode.GetImageData()
+    self.holefilledImageNode = sitkUtils.PushToSlicer(holefilledImage, "holefilledImage", 0, False)
+    if self.holefilledImageNode:
+      holefilledImageData = self.holefilledImageNode.GetImageData()
       cast = vtk.vtkImageCast()
       cast.SetInputData(holefilledImageData)
       cast.SetOutputScalarTypeToUnsignedChar()
@@ -513,7 +513,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       labelVolumeNode.SetSpacing(holefilledImageData.GetSpacing())
       labelVolumeNode.SetOrigin(holefilledImageData.GetOrigin())
       matrix = vtk.vtkMatrix4x4()
-      holefilledImageNode.GetIJKToRASMatrix(matrix)
+      self.holefilledImageNode.GetIJKToRASMatrix(matrix)
       labelVolumeNode.SetIJKToRASMatrix(matrix)
       labelImage = cast.GetOutput()
       labelVolumeNode.SetAndObserveImageData(labelImage)
@@ -523,7 +523,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       outputModelNode.GetDisplayNode().SetOpacity(0.2)
       self.calculateSurfaceGrayScale(labelVolumeNode, outputModelNode)
       smoother = vtk.vtkWindowedSincPolyDataFilter()
-      smoother.SetInputConnection(outputModelNode.GetPolyData())
+      smoother.SetInputData(outputModelNode.GetPolyData())
       smoother.SetNumberOfIterations(15)
       smoother.BoundarySmoothingOn()
       smoother.FeatureEdgeSmoothingOff()
@@ -557,29 +557,39 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
         self.trueSagittalPlane.SetOrigin(posNasion[0], posNasion[1], posNasion[2])
         self.trueSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
 
-  def cutSurface(self, inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode):
+  def cutSurface(self, inputVolume, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode):
     ###All calculation is based on the RAS coordinates system
-    if inputModelNode and (nasionNode.GetNumberOfMarkups()):
+    if inputVolume and (nasionNode.GetNumberOfMarkups()):
       cube = vtk.vtkCubeSource()
       box = vtk.vtkBox()
       clipper = vtk.vtkClipPolyData()
       posNasion = numpy.array([0.0, 0.0, 0.0])
+
+      labelVolumeNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLLabelMapVolumeNode")
+      slicer.mrmlScene.AddNode(labelVolumeNode)
+      labelVolumeNode.SetName("Clipped")
+      labelVolumeNode.SetSpacing(inputVolume.GetSpacing())
+      labelVolumeNode.SetOrigin(inputVolume.GetOrigin())
       nasionNode.GetNthFiducialPosition(nasionNode.GetNumberOfMarkups() - 1, posNasion)
       cube.SetCenter(posNasion[0], posNasion[1], posNasion[2])
       cube.SetXLength(100)
-      cube.SetYLength(50)
+      cube.SetYLength(30)
       cube.SetZLength(50)
       cube.Update()
-      box.SetBounds(cube.GetOutput().GetBounds())
-      clipper.SetClipFunction(box)
-      clipper.SetInputData(inputModelNode.GetPolyData())
-      clipper.InsideOutOn()
-      clipper.Update()
+      self.clipVolumeWithModel(inputVolume, cube.GetOutput(), True, 0, labelVolumeNode)
+
       outputPoly = clipper.GetOutput()
       outputModelNode.CreateDefaultDisplayNodes()
       outputModelNode.SetAttribute("vtkMRMLModelNode.modelCreated", "True")
       outputModelNode.GetDisplayNode().SetVisibility(1)
       outputModelNode.GetDisplayNode().SetOpacity(0.6)
+      outputModelNode.SetAndObservePolyData(outputPoly)
+      """
+      box.SetBounds(cube.GetOutput().GetBounds())
+      clipper.SetClipFunction(box)
+      clipper.SetInputData(inputModelNode.GetPolyData())
+      clipper.InsideOutOn()
+      clipper.Update()
       self.generateKocherNav(inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength)
       appendFilter = vtk.vtkAppendPolyData()
       appendFilter.AddInputData(clipper.GetOutput())
@@ -592,6 +602,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       appendFilter.Update()
       outputModelNode.SetAndObservePolyData(appendFilter.GetOutput())
       appendFilter.RemoveAllInputs()
+      """
     pass
 
   def generateKocherNav(self, inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength):
@@ -713,6 +724,59 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     CurveManager.cmLogic.setInterpolationMethod(1)
     CurveManager.cmLogic.setTubeRadius(0.5)
     self.topPoint = points.GetPoint(jPos)
+
+  def clipVolumeWithModel(self, inputVolume, clippingPolyData, clipOutsideSurface, fillValue, outputLabelVolume):
+    """
+    Fill voxels of the input volume inside/outside the clipping model with the provided fill value
+    """
+
+    # Determine the transform between the box and the image IJK coordinate systems
+
+    ijkToRas = vtk.vtkMatrix4x4()
+    inputVolume.GetIJKToRASMatrix( ijkToRas )
+    modelToIjkTransform = vtk.vtkTransform()
+    modelToIjkTransform.SetMatrix(ijkToRas)
+    modelToIjkTransform.Inverse()
+    transformModelToIjk=vtk .vtkTransformPolyDataFilter()
+    transformModelToIjk.SetTransform(modelToIjkTransform)
+    transformModelToIjk.SetInputData(clippingPolyData)
+
+    # Use the stencil to fill the volume
+
+    # Convert model to stencil
+    polyToStencil = vtk.vtkPolyDataToImageStencil()
+    polyToStencil.SetInputConnection(transformModelToIjk.GetOutputPort())
+    polyToStencil.SetOutputSpacing(inputVolume.GetImageData().GetSpacing())
+    polyToStencil.SetOutputOrigin(inputVolume.GetImageData().GetOrigin())
+    polyToStencil.SetOutputWholeExtent(inputVolume.GetImageData().GetExtent())
+
+    # Apply the stencil to the volume
+    stencilToImage= vtk .vtkImageStencil()
+    stencilToImage.SetInputConnection(inputVolume.GetImageDataConnection())
+    stencilToImage.SetStencilConnection(polyToStencil.GetOutputPort())
+    if clipOutsideSurface:
+      stencilToImage.ReverseStencilOff()
+    else:
+      stencilToImage.ReverseStencilOn()
+    stencilToImage.SetBackgroundValue(fillValue)
+    stencilToImage.Update()
+
+    # Update the volume with the stencil operation result
+    outputImageData = vtk.vtkImageData()
+    outputImageData.DeepCopy(stencilToImage.GetOutput())
+
+    matrix = vtk.vtkMatrix4x4()
+    self.holefilledImageNode.GetIJKToRASMatrix(matrix)
+    outputLabelVolume.SetIJKToRASMatrix(matrix)
+    cast = vtk.vtkImageCast()
+    cast.SetInputData(outputImageData)
+    cast.SetOutputScalarTypeToUnsignedChar()
+    cast.Update()
+    labelImage = cast.GetOutput()
+    outputLabelVolume.SetAndObserveImageData(labelImage)
+    outputLabelVolume.SetIJKToRASMatrix(ijkToRas)
+
+    return True
 
 
 class VentriculostomySurfaceCutTest(ScriptedLoadableModuleTest):
