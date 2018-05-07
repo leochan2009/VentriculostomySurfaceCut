@@ -155,6 +155,7 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     globals()[moduleName] = slicer.util.reloadScriptedModule(moduleName)
 
   def cleanup(self):
+    self.logic.labelVolumeNode = None
     self.logic.coronalReferenceCurveManager.clear()
     self.logic.sagittalReferenceCurveManager.clear()
     pass
@@ -186,7 +187,7 @@ class CurveManagerSurfaceCut():
     self.curveFiducials = None
     self._curveModel = None
     self.opacity = 1
-    self.tubeRadius = 1.0
+    self.tubeRadius = 10.0
     self.curveName = ""
     self.curveModelName = ""
     self.step = 1
@@ -443,7 +444,9 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     self.sagittalYawAngle = 0.0
     self.holefilledImageNode = None
     self.labelVolumeNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLLabelMapVolumeNode")
-    self.labelVolumeNode.SetName("Clipped")
+    self.labelVolumeNode.SetName("Base")
+    self.guideVolumeNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLLabelMapVolumeNode")
+    self.guideVolumeNode.SetName("Guide")
 
   def hasImageData(self,volumeNode):
     """This is an example logic method that
@@ -493,7 +496,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     dilateFilter.SetForegroundValue(1)
     dilatedImage = dilateFilter.Execute(paddedImage)
     erodeFilter = sitk.BinaryErodeImageFilter()
-    erodeFilter.SetKernelRadius([7, 7, 6])
+    erodeFilter.SetKernelRadius([10, 10, 6])
     erodeFilter.SetBackgroundValue(0)
     erodeFilter.SetForegroundValue(1)
     erodedImage = erodeFilter.Execute(dilatedImage)
@@ -559,46 +562,62 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
   def cutSurface(self, inputVolume, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode, outputCutModelNode):
     ###All calculation is based on the RAS coordinates system
     if inputVolume and (nasionNode.GetNumberOfMarkups()):
-      cube = vtk.vtkCubeSource()
-      box = vtk.vtkBox()
-      posNasion = numpy.array([0.0, 0.0, 0.0])
-      nasionNode.GetNthFiducialPosition(nasionNode.GetNumberOfMarkups() - 1, posNasion)
-      cube.SetCenter(posNasion[0], posNasion[1], posNasion[2])
-      cube.SetXLength(100)
-      cube.SetYLength(30)
-      cube.SetZLength(50)
-      cube.Update()
       self.labelVolumeNode.SetSpacing(inputVolume.GetSpacing())
       self.labelVolumeNode.SetOrigin(inputVolume.GetOrigin())
       slicer.mrmlScene.AddNode(self.labelVolumeNode)
-      self.clipVolumeWithModel(inputVolume, cube.GetOutput(), True, 1, self.labelVolumeNode)
-
-      clipper = vtk.vtkClipPolyData()
-      outputPoly = vtk.vtkPolyData()
-      box.SetBounds(cube.GetOutput().GetBounds())
-      clipper.SetClipFunction(box)
-      clipper.SetInputData(outputModelNode.GetPolyData())
-      clipper.InsideOutOn()
-      clipper.Update()
+      self.guideVolumeNode.SetSpacing(inputVolume.GetSpacing())
+      self.guideVolumeNode.SetOrigin(inputVolume.GetOrigin())
+      slicer.mrmlScene.AddNode(self.guideVolumeNode)
+      self.createTrueSagittalPlane(nasionNode)
       self.generateKocherNav(outputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength)
-      appendFilter = vtk.vtkAppendPolyData()
-      appendFilter.AddInputData(clipper.GetOutput())
-      appendFilter.AddInputData(self.sagittalReferenceCurveManager._curveModel.GetPolyData())
-      appendFilter.Update()
-      outputPoly.DeepCopy(appendFilter.GetOutput())
-      appendFilter.RemoveAllInputs()
-      appendFilter.AddInputData(outputPoly)
-      appendFilter.AddInputData(self.coronalReferenceCurveManager._curveModel.GetPolyData())
-      appendFilter.Update()
-      outputCutModelNode.SetAndObservePolyData(appendFilter.GetOutput())
+      basePolyData = self.generateBaseModel(inputVolume, nasionNode)
+      self.clipVolumeWithModel(inputVolume, basePolyData, True, 1,
+                               self.labelVolumeNode)
+      hooker = vtk.vtkSphereSource()
+      posNasion = numpy.array([0.0, 0.0, 0.0])
+      nasionNode.GetNthFiducialPosition(0, posNasion)
+      hooker.SetCenter(posNasion[0],posNasion[1],posNasion[2])
+      hooker.SetRadius(20.0)
+      hooker.Update()
+      self.clipVolumeWithModel(inputVolume, hooker.GetOutput(), True, 1,
+                               self.guideVolumeNode)
+      self.clipVolumeWithModel(inputVolume, self.sagittalReferenceCurveManager._curveModel.GetPolyData(), True, 1, self.guideVolumeNode)
+      self.clipVolumeWithModel(inputVolume, self.coronalReferenceCurveManager._curveModel.GetPolyData(), True, 1, self.guideVolumeNode)
+      subtractFilter = vtk.vtkImageMathematics()
+      subtractFilter.SetInput1Data(self.labelVolumeNode.GetImageData())
+      subtractFilter.SetInput2Data(self.guideVolumeNode.GetImageData())
+      subtractFilter.SetOperationToSubtract()
+      subtractFilter.Update()
+      self.labelVolumeNode.SetAndObserveImageData(subtractFilter.GetOutput())
     pass
+
+  def generateBaseModel(self, inputVolume, nasionNode):
+    #ijkToRas = vtk.vtkMatrix4x4()
+    #inputVolume.GetIJKToRASMatrix(ijkToRas)
+    cube = vtk.vtkCubeSource()
+    posNasion = numpy.array([0.0, 0.0, 0.0])
+    nasionNode.GetNthFiducialPosition(0, posNasion)
+    fullMatrix = self.calculateMatrixBasedPos(posNasion, self.sagittalYawAngle, 0.0, 0.0)
+    cube.SetCenter(posNasion[0], posNasion[1], posNasion[2])
+    cube.SetXLength(130)
+    cube.SetYLength(50)
+    cube.SetZLength(50)
+    cube.Update()
+    #ijkToRas.Multiply4x4(fullMatrix, ijkToRas, ijkToRas)
+    modelToIjkTransform = vtk.vtkTransform()
+    modelToIjkTransform.SetMatrix(fullMatrix)
+    modelToIjkTransform.Inverse()
+    transformModelToIjk = vtk.vtkTransformPolyDataFilter()
+    transformModelToIjk.SetTransform(modelToIjkTransform)
+    transformModelToIjk.SetInputData(cube.GetOutput())
+    transformModelToIjk.Update()
+    return transformModelToIjk.GetOutput()
 
   def generateKocherNav(self, inputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength):
     polyData = inputModelNode.GetPolyData()
-    self.createTrueSagittalPlane(nasionNode)
     if polyData and self.trueSagittalPlane and nasionNode.GetNumberOfMarkups() > 0:
       posNasion = numpy.array([0.0, 0.0, 0.0])
-      nasionNode.GetNthFiducialPosition(nasionNode.GetNumberOfMarkups() - 1, posNasion)
+      nasionNode.GetNthFiducialPosition(0, posNasion)
       sagittalPoints = vtk.vtkPoints()
       self.getIntersectPoints(polyData, self.trueSagittalPlane, posNasion, sagittalReferenceLength, 0, sagittalPoints)
       ## Sorting
@@ -710,30 +729,59 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     CurveManager.cmLogic.CurvePoly = vtk.vtkPolyData()  ## For CurveMaker bug
     CurveManager.cmLogic.enableAutomaticUpdate(1)
     CurveManager.cmLogic.setInterpolationMethod(1)
-    CurveManager.cmLogic.setTubeRadius(0.5)
+    CurveManager.cmLogic.setTubeRadius(5)
     self.topPoint = points.GetPoint(jPos)
+
+  def calculateMatrixBasedPos(self, pos, yaw, pitch, roll):
+    tempMatrix = vtk.vtkMatrix4x4()
+    tempMatrix.Identity()
+    tempMatrix.SetElement(0, 3, -pos[0])
+    tempMatrix.SetElement(1, 3, -pos[1])
+    tempMatrix.SetElement(2, 3, -pos[2])
+    yawMatrix = vtk.vtkMatrix4x4()
+    yawMatrix.Identity()
+    yawMatrix.SetElement(0, 0, math.cos(yaw))
+    yawMatrix.SetElement(0, 1, math.sin(yaw))
+    yawMatrix.SetElement(1, 0, -math.sin(yaw))
+    yawMatrix.SetElement(1, 1, math.cos(yaw))
+    pitchMatrix = vtk.vtkMatrix4x4()
+    pitchMatrix.Identity()
+    pitchMatrix.SetElement(1, 1, math.cos(pitch))
+    pitchMatrix.SetElement(1, 2, math.sin(pitch))
+    pitchMatrix.SetElement(2, 1, -math.sin(pitch))
+    pitchMatrix.SetElement(2, 2, math.cos(pitch))
+    rollMatrix = vtk.vtkMatrix4x4()
+    rollMatrix.Identity()
+    rollMatrix.SetElement(0, 0, math.cos(roll))
+    rollMatrix.SetElement(0, 2, -math.sin(roll))
+    rollMatrix.SetElement(2, 0, math.sin(roll))
+    rollMatrix.SetElement(2, 2, math.cos(roll))
+    rollMatrix.SetElement(0, 3, pos[0])
+    rollMatrix.SetElement(1, 3, pos[1])
+    rollMatrix.SetElement(2, 3, pos[2])
+    totalMatrix = vtk.vtkMatrix4x4()
+    totalMatrix.Multiply4x4(yawMatrix, tempMatrix, totalMatrix)
+    totalMatrix.Multiply4x4(pitchMatrix, totalMatrix, totalMatrix)
+    totalMatrix.Multiply4x4(rollMatrix, totalMatrix, totalMatrix)
+    return totalMatrix
 
   def clipVolumeWithModel(self, inputVolume, clippingPolyData, clipOutsideSurface, fillValue, outputLabelVolume):
     """
     Fill voxels of the input volume inside/outside the clipping model with the provided fill value
     """
-
-    # Determine the transform between the box and the image IJK coordinate systems
-
+    # Use the stencil to fill the volume
     ijkToRas = vtk.vtkMatrix4x4()
-    inputVolume.GetIJKToRASMatrix( ijkToRas )
+    inputVolume.GetIJKToRASMatrix(ijkToRas)
     modelToIjkTransform = vtk.vtkTransform()
     modelToIjkTransform.SetMatrix(ijkToRas)
     modelToIjkTransform.Inverse()
-    transformModelToIjk=vtk .vtkTransformPolyDataFilter()
+    transformModelToIjk = vtk.vtkTransformPolyDataFilter()
     transformModelToIjk.SetTransform(modelToIjkTransform)
     transformModelToIjk.SetInputData(clippingPolyData)
-
-    # Use the stencil to fill the volume
-
+    transformModelToIjk.Update()
     # Convert model to stencil
     polyToStencil = vtk.vtkPolyDataToImageStencil()
-    polyToStencil.SetInputConnection(transformModelToIjk.GetOutputPort())
+    polyToStencil.SetInputData(transformModelToIjk.GetOutput())
     polyToStencil.SetOutputSpacing(inputVolume.GetImageData().GetSpacing())
     polyToStencil.SetOutputOrigin(inputVolume.GetImageData().GetOrigin())
     polyToStencil.SetOutputWholeExtent(inputVolume.GetImageData().GetExtent())
@@ -762,17 +810,19 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     subtractFilter.SetInput2Data(outputImageData)
     subtractFilter.SetOperationToSubtract()
     subtractFilter.Update()
-    matrix = vtk.vtkMatrix4x4()
-    self.holefilledImageNode.GetIJKToRASMatrix(matrix)
-    outputLabelVolume.SetIJKToRASMatrix(matrix)
     cast = vtk.vtkImageCast()
     cast.SetInputData(subtractFilter.GetOutput())
     cast.SetOutputScalarTypeToUnsignedChar()
     cast.Update()
     labelImage = cast.GetOutput()
-    outputLabelVolume.SetAndObserveImageData(labelImage)
-    outputLabelVolume.SetIJKToRASMatrix(ijkToRas)
-
+    subtractFilter.SetOperationToMax()
+    subtractFilter.SetInput1Data(labelImage)
+    subtractFilter.SetInput2Data(outputLabelVolume.GetImageData())
+    subtractFilter.Update()
+    outputLabelVolume.SetAndObserveImageData(subtractFilter.GetOutput())
+    matrix = vtk.vtkMatrix4x4()
+    inputVolume.GetIJKToRASMatrix(matrix)
+    outputLabelVolume.SetIJKToRASMatrix(matrix)
     return True
 
 
