@@ -41,9 +41,17 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
 
   def setup(self):
     ScriptedLoadableModuleWidget.setup(self)
-
+    
     # Instantiate and connect widgets ...
-
+    segmentationWidget = slicer.modules.segmentations.widgetRepresentation() 
+    self.activeSegmentSelector = segmentationWidget.findChild("qMRMLNodeComboBox", "MRMLNodeComboBox_Segmentation")
+    self.labelMapSelector = segmentationWidget.findChild("qMRMLNodeComboBox", "MRMLNodeComboBox_ImportExportNode")
+    self.importRadioButton = segmentationWidget.findChild("QRadioButton", "radioButton_Import")
+    self.exportRadioButton = segmentationWidget.findChild("QRadioButton", "radioButton_Export")
+    self.labelMapRadioButton = segmentationWidget.findChild("QRadioButton", "radioButton_Labelmap")
+    self.modelsRadioButton = segmentationWidget.findChild("QRadioButton", "radioButton_Model")
+    self.portPushButton = segmentationWidget.findChild("ctkPushButton", "PushButton_ImportExport")             
+          
     #
     # Parameters Area
     #
@@ -170,7 +178,26 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
 
   def onCutSurface(self):
     self.logic.cutSurface(self.logic.holefilledImageNode, self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outputSelector.currentNode(), self.outCutModelSelector.currentNode())
-
+    self.exportLabelMapToModel()
+  
+  def exportLabelMapToModel(self):
+    self.activeSegmentSelector.removeCurrentNode()
+    segNode = self.activeSegmentSelector.addNode()
+    segNode.CreateDefaultDisplayNodes()    
+    self.importRadioButton.click()
+    self.labelMapRadioButton.click()
+    #slicer.app.processEvents()
+    self.labelMapSelector.setCurrentNode(self.logic.guideVolumeNode)
+    self.portPushButton.click()
+    self.labelMapSelector.setCurrentNode(self.logic.labelVolumeNode)
+    self.portPushButton.click()
+    self.logic.sagittalReferenceCurveManager.setModelOpacity(0.0)
+    self.logic.coronalReferenceCurveManager.setModelOpacity(0.0)
+    self.exportRadioButton.click()
+    self.modelsRadioButton.click()
+    #slicer.app.processEvents()
+    self.portPushButton.click()
+    pass  
 #
 # VentriculostomySurfaceCutLogic
 #
@@ -260,7 +287,7 @@ class CurveManagerSurfaceCut():
     if self._curveModel:
       dnode = self._curveModel.GetDisplayNode()
       if dnode:
-        dnode.opacity(opacity)
+        dnode.SetOpacity(opacity)
 
   def setManagerTubeRadius(self, radius):
     self.tubeRadius = radius
@@ -570,16 +597,13 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       slicer.mrmlScene.AddNode(self.guideVolumeNode)
       self.createTrueSagittalPlane(nasionNode)
       self.generateKocherNav(outputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength)
-      basePolyData = self.generateBaseModel(inputVolume, nasionNode)
+      baseDimension = [130,50,50]
+      basePolyData = self.generateCubeModel(inputVolume, nasionNode, baseDimension)
       self.clipVolumeWithModel(inputVolume, basePolyData, True, 1,
                                self.labelVolumeNode)
-      hooker = vtk.vtkSphereSource()
-      posNasion = numpy.array([0.0, 0.0, 0.0])
-      nasionNode.GetNthFiducialPosition(0, posNasion)
-      hooker.SetCenter(posNasion[0],posNasion[1],posNasion[2])
-      hooker.SetRadius(20.0)
-      hooker.Update()
-      self.clipVolumeWithModel(inputVolume, hooker.GetOutput(), True, 1,
+      hookDim = [40, 20, 20]
+      hooker = self.generateCubeModel(inputVolume, nasionNode, hookDim)
+      self.clipVolumeWithModel(inputVolume, hooker, True, 1,
                                self.guideVolumeNode)
       self.clipVolumeWithModel(inputVolume, self.sagittalReferenceCurveManager._curveModel.GetPolyData(), True, 1, self.guideVolumeNode)
       self.clipVolumeWithModel(inputVolume, self.coronalReferenceCurveManager._curveModel.GetPolyData(), True, 1, self.guideVolumeNode)
@@ -588,10 +612,20 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       subtractFilter.SetInput2Data(self.guideVolumeNode.GetImageData())
       subtractFilter.SetOperationToSubtract()
       subtractFilter.Update()
-      self.labelVolumeNode.SetAndObserveImageData(subtractFilter.GetOutput())
+      thresholdFilter = vtk.vtkImageThreshold()
+      thresholdFilter.SetInputData(subtractFilter.GetOutput())
+      thresholdFilter.ThresholdByLower(2)
+      thresholdFilter.ReplaceOutOn()
+      thresholdFilter.SetOutValue(0)
+      thresholdFilter.Update()
+      cast = vtk.vtkImageCast()
+      cast.SetInputData(thresholdFilter.GetOutput())
+      cast.SetOutputScalarTypeToUnsignedChar()
+      cast.Update()
+      self.labelVolumeNode.SetAndObserveImageData(cast.GetOutput())
     pass
-
-  def generateBaseModel(self, inputVolume, nasionNode):
+  
+  def generateCubeModel(self, inputVolume, nasionNode, dimensions):
     #ijkToRas = vtk.vtkMatrix4x4()
     #inputVolume.GetIJKToRASMatrix(ijkToRas)
     cube = vtk.vtkCubeSource()
@@ -599,9 +633,9 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     nasionNode.GetNthFiducialPosition(0, posNasion)
     fullMatrix = self.calculateMatrixBasedPos(posNasion, self.sagittalYawAngle, 0.0, 0.0)
     cube.SetCenter(posNasion[0], posNasion[1], posNasion[2])
-    cube.SetXLength(130)
-    cube.SetYLength(50)
-    cube.SetZLength(50)
+    cube.SetXLength(dimensions[0])
+    cube.SetYLength(dimensions[1])
+    cube.SetZLength(dimensions[2])
     cube.Update()
     #ijkToRas.Multiply4x4(fullMatrix, ijkToRas, ijkToRas)
     modelToIjkTransform = vtk.vtkTransform()
