@@ -163,7 +163,7 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     globals()[moduleName] = slicer.util.reloadScriptedModule(moduleName)
 
   def cleanup(self):
-    self.logic.labelVolumeNode = None
+    self.logic.clear()
     self.logic.coronalReferenceCurveManager.clear()
     self.logic.sagittalReferenceCurveManager.clear()
     pass
@@ -177,8 +177,9 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.logic.createModel(self.inputSelector.currentNode(), self.outputSelector.currentNode(), imageThreshold)
 
   def onCutSurface(self):
-    self.logic.cutSurface(self.logic.holefilledImageNode, self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outputSelector.currentNode(), self.outCutModelSelector.currentNode())
+    self.logic.generateBaseLabel(self.logic.holefilledImageNode, self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outputSelector.currentNode(), self.outCutModelSelector.currentNode())
     self.exportLabelMapToModel()
+    self.logic.cutModel()
   
   def exportLabelMapToModel(self):
     self.activeSegmentSelector.removeCurrentNode()
@@ -187,8 +188,8 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.importRadioButton.click()
     self.labelMapRadioButton.click()
     #slicer.app.processEvents()
-    self.labelMapSelector.setCurrentNode(self.logic.guideVolumeNode)
-    self.portPushButton.click()
+    #self.labelMapSelector.setCurrentNode(self.logic.guideVolumeNode)
+    #self.portPushButton.click()
     self.labelMapSelector.setCurrentNode(self.logic.labelVolumeNode)
     self.portPushButton.click()
     self.logic.sagittalReferenceCurveManager.setModelOpacity(0.0)
@@ -197,6 +198,8 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.modelsRadioButton.click()
     #slicer.app.processEvents()
     self.portPushButton.click()
+    modelName = segNode.GetSegmentation().GetNthSegment(0).GetName()
+    self.logic.baseModel = slicer.mrmlScene.GetNodesByClassByName("vtkMRMLModelNode", modelName).GetItemAsObject(0)
     pass  
 #
 # VentriculostomySurfaceCutLogic
@@ -464,7 +467,22 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     self.coronalReferenceCurveManager.setSliceID("vtkMRMLSliceNodeGreen")
     self.coronalReferenceCurveManager.setDefaultSlicePositionToLastPoint()
     self.coronalReferenceCurveManager.setModelColor(0.5, 1.0, 0.5)
-
+    self.subtractedModel = slicer.mrmlScene.CreateNodeByClass("vtkMRMLModelNode")
+    self.subtractedModel.SetName("Not For Use")
+    slicer.mrmlScene.AddNode(self.subtractedModel)
+    self.baseModel = None
+    self.middlePart = slicer.mrmlScene.CreateNodeByClass("vtkMRMLModelNode")
+    self.middlePart.SetName("MiddlePart")
+    slicer.mrmlScene.AddNode(self.middlePart )
+    self.middlePart.CreateDefaultDisplayNodes()
+    self.leftPart = slicer.mrmlScene.CreateNodeByClass("vtkMRMLModelNode")
+    self.leftPart.SetName("LeftPart")
+    slicer.mrmlScene.AddNode(self.leftPart)
+    self.leftPart.CreateDefaultDisplayNodes()
+    self.rightPart = slicer.mrmlScene.CreateNodeByClass("vtkMRMLModelNode")
+    self.rightPart.SetName("RightPart")
+    slicer.mrmlScene.AddNode(self.rightPart)
+    self.rightPart.CreateDefaultDisplayNodes()
     self.topPoint = []
     self.trueSagittalPlane = None
     self.useLeftHemisphere = False
@@ -472,8 +490,30 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     self.holefilledImageNode = None
     self.labelVolumeNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLLabelMapVolumeNode")
     self.labelVolumeNode.SetName("Base")
+    slicer.mrmlScene.AddNode(self.labelVolumeNode)
     self.guideVolumeNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLLabelMapVolumeNode")
     self.guideVolumeNode.SetName("Guide")
+    slicer.mrmlScene.AddNode(self.guideVolumeNode)
+
+  def clear(self):
+    if self.leftPart:
+      slicer.mrmlScene.RemoveNode(self.leftPart)
+    if self.rightPart:
+      slicer.mrmlScene.RemoveNode(self.rightPart)
+    if self.middlePart:
+      slicer.mrmlScene.RemoveNode(self.middlePart)
+    if self.subtractedModel:
+      slicer.mrmlScene.RemoveNode(self.subtractedModel)
+    if self.labelVolumeNode:
+      slicer.mrmlScene.RemoveNode(self.labelVolumeNode)
+    if self.guideVolumeNode:
+      slicer.mrmlScene.RemoveNode(self.guideVolumeNode)
+    self.leftPart = None
+    self.rightPart = None
+    self.middlePart = None
+    self.subtractedModel = None
+    self.labelVolumeNode = None
+    self.guideVolumeNode = None
 
   def hasImageData(self,volumeNode):
     """This is an example logic method that
@@ -505,7 +545,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
   def createModel(self, ventricleVolume, outputModelNode, thresholdValue):
     resampleFilter = sitk.ResampleImageFilter()
     ventricleImage = sitk.Cast(sitkUtils.PullFromSlicer(ventricleVolume.GetID()), sitk.sitkInt16)
-    self.samplingFactor = 2
+    self.samplingFactor = 1
     resampleFilter.SetSize(numpy.array(ventricleImage.GetSize()) / self.samplingFactor)
     resampleFilter.SetOutputSpacing(numpy.array(ventricleImage.GetSpacing()) * self.samplingFactor)
     resampleFilter.SetOutputDirection(ventricleImage.GetDirection())
@@ -529,16 +569,29 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     erodedImage = erodeFilter.Execute(dilatedImage)
     fillHoleFilter = sitk.BinaryFillholeImageFilter()
     holefilledImage = fillHoleFilter.Execute(erodedImage)
+    dilateFilter.SetKernelRadius([5, 5, 3])
+    dilateFilter.SetBackgroundValue(0)
+    dilateFilter.SetForegroundValue(1)
+    dilatedImage = dilateFilter.Execute(holefilledImage)
+    subtractFilter = sitk.SubtractImageFilter()
+    subtractedImage = subtractFilter.Execute(dilatedImage, holefilledImage)
     self.holefilledImageNode = sitkUtils.PushToSlicer(holefilledImage, "holefilledImage", 0, False)
-    if self.holefilledImageNode:
-      holefilledImageData = self.holefilledImageNode.GetImageData()
+    self.subtractedImageNode = sitkUtils.PushToSlicer(subtractedImage, "subtractedImage", 0, False)
+    self.createModelBasedOnImageNode(self.holefilledImageNode, outputModelNode)
+    self.createModelBasedOnImageNode(self.subtractedImageNode, self.subtractedModel)
+    self.subtractedModel.SetDisplayVisibility(False)
+    return
+
+  def createModelBasedOnImageNode(self, imageNode, outputModelNode):
+    if imageNode:
+      holefilledImageData = imageNode.GetImageData()
       cast = vtk.vtkImageCast()
       cast.SetInputData(holefilledImageData)
       cast.SetOutputScalarTypeToUnsignedChar()
       cast.Update()
       labelVolumeNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLLabelMapVolumeNode")
       slicer.mrmlScene.AddNode(labelVolumeNode)
-      labelVolumeNode.SetName("Threshold")
+      labelVolumeNode.SetName(imageNode.GetName()+"_Label")
       labelVolumeNode.SetSpacing(holefilledImageData.GetSpacing())
       labelVolumeNode.SetOrigin(holefilledImageData.GetOrigin())
       matrix = vtk.vtkMatrix4x4()
@@ -546,7 +599,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       labelVolumeNode.SetIJKToRASMatrix(matrix)
       labelImage = cast.GetOutput()
       labelVolumeNode.SetAndObserveImageData(labelImage)
-      #outputModelNode.SetAndObservePolyData(outputModel)
+      # outputModelNode.SetAndObservePolyData(outputModel)
       outputModelNode.CreateDefaultDisplayNodes()
       outputModelNode.GetDisplayNode().SetVisibility(1)
       outputModelNode.GetDisplayNode().SetOpacity(0.2)
@@ -563,7 +616,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
       smoother.Update()
       outputModelNode.SetAndObservePolyData(smoother.GetOutput())
       return
-  
+
   def calculateSurfaceGrayScale(self, inputVolumeNode, grayScaleModelNode):    
       parameters = {}
       parameters["InputVolume"] = inputVolumeNode.GetID()
@@ -586,48 +639,90 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
         self.trueSagittalPlane.SetOrigin(posNasion[0], posNasion[1], posNasion[2])
         self.trueSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
 
-  def cutSurface(self, inputVolume, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode, outputCutModelNode):
+  def createCutPlanes(self, entryPos, nasionPos):
+    planes = vtk.vtkPlaneCollection()
+    trueSagittalPlane = vtk.vtkPlane()
+    trueSagittalPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
+    trueSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
+    planes.AddItem(trueSagittalPlane)
+    upCoronalPlane = vtk.vtkPlane()
+    upCoronalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
+    upCoronalPlane.SetNormal(-math.sin(self.sagittalYawAngle), math.cos(self.sagittalYawAngle), 0)
+    planes.AddItem(upCoronalPlane)
+    outsideSagittalPlane = vtk.vtkPlane()
+    outsideSagittalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
+    outsideSagittalPlane.SetNormal(-math.cos(self.sagittalYawAngle), -math.sin(self.sagittalYawAngle), 0)
+    planes.AddItem(outsideSagittalPlane)
+    lowerAxiaPlane = vtk.vtkPlane()
+    lowerAxiaPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
+    lowerAxiaPlane.SetNormal(-math.sin(self.sagittalYawAngle), 0, math.cos(self.sagittalYawAngle))
+    planes.AddItem(lowerAxiaPlane)
+    return planes
+
+  def generateBaseLabel(self, inputVolume, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode, outputCutModelNode):
     ###All calculation is based on the RAS coordinates system
     if inputVolume and (nasionNode.GetNumberOfMarkups()):
       self.labelVolumeNode.SetSpacing(inputVolume.GetSpacing())
       self.labelVolumeNode.SetOrigin(inputVolume.GetOrigin())
-      slicer.mrmlScene.AddNode(self.labelVolumeNode)
       self.guideVolumeNode.SetSpacing(inputVolume.GetSpacing())
       self.guideVolumeNode.SetOrigin(inputVolume.GetOrigin())
-      slicer.mrmlScene.AddNode(self.guideVolumeNode)
       self.createTrueSagittalPlane(nasionNode)
       self.generateKocherNav(outputModelNode, nasionNode, sagittalReferenceLength, coronalReferenceLength)
-      baseDimension = [130,50,50]
-      basePolyData = self.generateCubeModel(inputVolume, nasionNode, baseDimension)
+      self.baseDimension = [130, 50, 50]
+      basePolyData = self.generateCubeModel(nasionNode, self.baseDimension)
       self.clipVolumeWithModel(inputVolume, basePolyData, True, 1,
                                self.labelVolumeNode)
-      hookDim = [40, 20, 20]
-      hooker = self.generateCubeModel(inputVolume, nasionNode, hookDim)
-      self.clipVolumeWithModel(inputVolume, hooker, True, 1,
-                               self.guideVolumeNode)
-      self.clipVolumeWithModel(inputVolume, self.sagittalReferenceCurveManager._curveModel.GetPolyData(), True, 1, self.guideVolumeNode)
-      self.clipVolumeWithModel(inputVolume, self.coronalReferenceCurveManager._curveModel.GetPolyData(), True, 1, self.guideVolumeNode)
-      subtractFilter = vtk.vtkImageMathematics()
-      subtractFilter.SetInput1Data(self.labelVolumeNode.GetImageData())
-      subtractFilter.SetInput2Data(self.guideVolumeNode.GetImageData())
-      subtractFilter.SetOperationToSubtract()
-      subtractFilter.Update()
-      thresholdFilter = vtk.vtkImageThreshold()
-      thresholdFilter.SetInputData(subtractFilter.GetOutput())
-      thresholdFilter.ThresholdByLower(2)
-      thresholdFilter.ReplaceOutOn()
-      thresholdFilter.SetOutValue(0)
-      thresholdFilter.Update()
-      cast = vtk.vtkImageCast()
-      cast.SetInputData(thresholdFilter.GetOutput())
-      cast.SetOutputScalarTypeToUnsignedChar()
-      cast.Update()
-      self.labelVolumeNode.SetAndObserveImageData(cast.GetOutput())
+      #self.subtractedModel.SetAndObservePolyData(cuttedPolyData)
+
     pass
-  
-  def generateCubeModel(self, inputVolume, nasionNode, dimensions):
-    #ijkToRas = vtk.vtkMatrix4x4()
-    #inputVolume.GetIJKToRASMatrix(ijkToRas)
+
+  def cutModel(self):
+    appendFilter = vtk.vtkAppendPolyData()
+    appendFilter.AddInputData(self.baseModel.GetPolyData())
+    appendFilter.AddInputData(self.subtractedModel.GetPolyData())
+    appendFilter.Update()
+    entryPos = [0.0] * 3
+    markerNum = self.coronalReferenceCurveManager.curveFiducials.GetNumberOfFiducials()
+    self.coronalReferenceCurveManager.curveFiducials.GetNthFiducialPosition(markerNum - 1, entryPos)
+    nasionPos = [0.0] * 3
+    self.sagittalReferenceCurveManager.curveFiducials.GetNthFiducialPosition(0, nasionPos)
+    nasionPos[2] = nasionPos[2] - self.baseDimension[2]/2
+    clipper = vtk.vtkClipClosedSurface()
+    planes = self.createCutPlanes(entryPos, nasionPos)
+    clipper.SetClippingPlanes(planes)
+    clipper.SetActivePlaneId(2)
+    clipper.SetInputData(appendFilter.GetOutput())
+    clipper.Update()
+    cuttedPolyData = clipper.GetOutput()
+    self.middlePart.SetAndObservePolyData(cuttedPolyData)
+
+    clipper = vtk.vtkClipClosedSurface()
+    planes = vtk.vtkPlaneCollection()
+    outsideSagittalPlane = vtk.vtkPlane()
+    outsideSagittalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
+    outsideSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
+    planes.AddItem(outsideSagittalPlane)
+    clipper.SetClippingPlanes(planes)
+    clipper.SetActivePlaneId(2)
+    clipper.SetInputData(self.baseModel.GetPolyData())
+    clipper.Update()
+    cuttedPolyData = clipper.GetOutput()
+    self.leftPart.SetAndObservePolyData(cuttedPolyData)
+
+    clipper = vtk.vtkClipClosedSurface()
+    planes = vtk.vtkPlaneCollection()
+    sagittalPlane = vtk.vtkPlane()
+    sagittalPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
+    sagittalPlane.SetNormal(-math.cos(self.sagittalYawAngle), -math.sin(self.sagittalYawAngle), 0)
+    planes.AddItem(sagittalPlane)
+    clipper.SetClippingPlanes(planes)
+    clipper.SetActivePlaneId(2)
+    clipper.SetInputData(self.baseModel.GetPolyData())
+    clipper.Update()
+    cuttedPolyData = clipper.GetOutput()
+    self.rightPart.SetAndObservePolyData(cuttedPolyData)
+
+  def generateCubeModel(self, nasionNode, dimensions):
     cube = vtk.vtkCubeSource()
     posNasion = numpy.array([0.0, 0.0, 0.0])
     nasionNode.GetNthFiducialPosition(0, posNasion)
@@ -637,7 +732,6 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     cube.SetYLength(dimensions[1])
     cube.SetZLength(dimensions[2])
     cube.Update()
-    #ijkToRas.Multiply4x4(fullMatrix, ijkToRas, ijkToRas)
     modelToIjkTransform = vtk.vtkTransform()
     modelToIjkTransform.SetMatrix(fullMatrix)
     modelToIjkTransform.Inverse()
