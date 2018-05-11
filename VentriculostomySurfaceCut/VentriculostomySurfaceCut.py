@@ -107,18 +107,6 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.inputNasionSelector.setToolTip("Pick the input nasion node to the algorithm.")
     parametersFormLayout.addRow("Input Nasion node: ", self.inputNasionSelector)
 
-
-    self.outCutModelSelector = slicer.qMRMLNodeComboBox()
-    self.outCutModelSelector.nodeTypes = ["vtkMRMLModelNode"]
-    self.outCutModelSelector.selectNodeUponCreation = True
-    self.outCutModelSelector.addEnabled = True
-    self.outCutModelSelector.removeEnabled = True
-    self.outCutModelSelector.noneEnabled = True
-    self.outCutModelSelector.showHidden = False
-    self.outCutModelSelector.showChildNodeTypes = False
-    self.outCutModelSelector.setMRMLScene(slicer.mrmlScene)
-    self.outCutModelSelector.setToolTip("Pick the output model to the algorithm.")
-    parametersFormLayout.addRow("Output cutted Model: ", self.outCutModelSelector)
     #
     # threshold value
     #
@@ -149,7 +137,6 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
     self.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
     self.inputNasionSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
     self.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
-    self.outCutModelSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSelect)
 
     self.logic = VentriculostomySurfaceCutLogic()
     # Add vertical spacer
@@ -170,14 +157,14 @@ class VentriculostomySurfaceCutWidget(ScriptedLoadableModuleWidget):
 
   def onSelect(self):
     self.onCreateSurfaceButton.enabled = self.inputSelector.currentNode() and self.outputSelector.currentNode()
-    self.onCutSurfaceButton.enabled = self.inputSelector.currentNode() and self.inputNasionSelector.currentNode() and self.outputSelector.currentNode() and self.outCutModelSelector.currentNode()
+    self.onCutSurfaceButton.enabled = self.inputSelector.currentNode() and self.inputNasionSelector.currentNode() and self.outputSelector.currentNode()
 
   def onCreateSurface(self):
     imageThreshold = self.imageThresholdSliderWidget.value
     self.logic.createModel(self.inputSelector.currentNode(), self.outputSelector.currentNode(), imageThreshold)
 
   def onCutSurface(self):
-    self.logic.generateBaseLabel(self.logic.holefilledImageNode, self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outputSelector.currentNode(), self.outCutModelSelector.currentNode())
+    self.logic.generateBaseLabel(self.logic.holefilledImageNode, self.inputNasionSelector.currentNode(), 100.0, 30.0, self.outputSelector.currentNode())
     self.exportLabelMapToModel()
     self.logic.cutModel()
   
@@ -471,6 +458,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     self.subtractedModel.SetName("Not For Use")
     slicer.mrmlScene.AddNode(self.subtractedModel)
     self.baseModel = None
+    self.rightSide = 1
     self.middlePart = slicer.mrmlScene.CreateNodeByClass("vtkMRMLModelNode")
     self.middlePart.SetName("MiddlePart")
     slicer.mrmlScene.AddNode(self.middlePart )
@@ -545,7 +533,7 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
   def createModel(self, ventricleVolume, outputModelNode, thresholdValue):
     resampleFilter = sitk.ResampleImageFilter()
     ventricleImage = sitk.Cast(sitkUtils.PullFromSlicer(ventricleVolume.GetID()), sitk.sitkInt16)
-    self.samplingFactor = 1
+    self.samplingFactor = 2
     resampleFilter.SetSize(numpy.array(ventricleImage.GetSize()) / self.samplingFactor)
     resampleFilter.SetOutputSpacing(numpy.array(ventricleImage.GetSpacing()) * self.samplingFactor)
     resampleFilter.SetOutputDirection(ventricleImage.GetDirection())
@@ -639,27 +627,16 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
         self.trueSagittalPlane.SetOrigin(posNasion[0], posNasion[1], posNasion[2])
         self.trueSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
 
-  def createCutPlanes(self, entryPos, nasionPos):
-    planes = vtk.vtkPlaneCollection()
-    trueSagittalPlane = vtk.vtkPlane()
-    trueSagittalPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
-    trueSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
-    planes.AddItem(trueSagittalPlane)
-    upCoronalPlane = vtk.vtkPlane()
-    upCoronalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
-    upCoronalPlane.SetNormal(-math.sin(self.sagittalYawAngle), math.cos(self.sagittalYawAngle), 0)
-    planes.AddItem(upCoronalPlane)
-    outsideSagittalPlane = vtk.vtkPlane()
-    outsideSagittalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
-    outsideSagittalPlane.SetNormal(-math.cos(self.sagittalYawAngle), -math.sin(self.sagittalYawAngle), 0)
-    planes.AddItem(outsideSagittalPlane)
-    lowerAxiaPlane = vtk.vtkPlane()
-    lowerAxiaPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
-    lowerAxiaPlane.SetNormal(-math.sin(self.sagittalYawAngle), 0, math.cos(self.sagittalYawAngle))
-    planes.AddItem(lowerAxiaPlane)
-    return planes
+  def getClosedCuttedModel(self, cutPlanes, polyData):
+    clipper = vtk.vtkClipClosedSurface()
+    clipper.SetClippingPlanes(cutPlanes)
+    clipper.SetActivePlaneId(2)
+    clipper.SetInputData(polyData)
+    clipper.Update()
+    cuttedPolyData = clipper.GetOutput()
+    return cuttedPolyData
 
-  def generateBaseLabel(self, inputVolume, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode, outputCutModelNode):
+  def generateBaseLabel(self, inputVolume, nasionNode, sagittalReferenceLength, coronalReferenceLength, outputModelNode):
     ###All calculation is based on the RAS coordinates system
     if inputVolume and (nasionNode.GetNumberOfMarkups()):
       self.labelVolumeNode.SetSpacing(inputVolume.GetSpacing())
@@ -687,40 +664,52 @@ class VentriculostomySurfaceCutLogic(ScriptedLoadableModuleLogic):
     nasionPos = [0.0] * 3
     self.sagittalReferenceCurveManager.curveFiducials.GetNthFiducialPosition(0, nasionPos)
     nasionPos[2] = nasionPos[2] - self.baseDimension[2]/2
-    clipper = vtk.vtkClipClosedSurface()
-    planes = self.createCutPlanes(entryPos, nasionPos)
-    clipper.SetClippingPlanes(planes)
-    clipper.SetActivePlaneId(2)
-    clipper.SetInputData(appendFilter.GetOutput())
-    clipper.Update()
-    cuttedPolyData = clipper.GetOutput()
-    self.middlePart.SetAndObservePolyData(cuttedPolyData)
-
-    clipper = vtk.vtkClipClosedSurface()
     planes = vtk.vtkPlaneCollection()
+    trueSagittalPlane = vtk.vtkPlane()
+    trueSagittalPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
+    trueSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
+    planes.AddItem(trueSagittalPlane)
+    upCoronalPlane = vtk.vtkPlane()
+    upCoronalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
+    upCoronalPlane.SetNormal(-math.sin(self.sagittalYawAngle), math.cos(self.sagittalYawAngle), 0)
+    planes.AddItem(upCoronalPlane)
     outsideSagittalPlane = vtk.vtkPlane()
     outsideSagittalPlane.SetOrigin(entryPos[0], entryPos[1], entryPos[2])
+    outsideSagittalPlane.SetNormal(-math.cos(self.sagittalYawAngle), -math.sin(self.sagittalYawAngle), 0)
+    planes.AddItem(outsideSagittalPlane)
+    lowerAxiaPlane = vtk.vtkPlane()
+    lowerAxiaPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
+    lowerAxiaPlane.SetNormal(0, 0, 1)
+    planes.AddItem(lowerAxiaPlane)
+    cuttedPolyDataMiddle = self.getClosedCuttedModel(planes, appendFilter.GetOutput())
+    planes = vtk.vtkPlaneCollection()
+    outsideSagittalPlaneShifted = vtk.vtkPlane()
+    outsideSagittalPlaneShifted.SetOrigin(entryPos[0]+0.5*self.rightSide, entryPos[1], entryPos[2])
+    outsideSagittalPlaneShifted.SetNormal(-math.cos(self.sagittalYawAngle), -math.sin(self.sagittalYawAngle), 0)
     outsideSagittalPlane.SetNormal(math.cos(self.sagittalYawAngle), math.sin(self.sagittalYawAngle), 0)
     planes.AddItem(outsideSagittalPlane)
-    clipper.SetClippingPlanes(planes)
-    clipper.SetActivePlaneId(2)
-    clipper.SetInputData(self.baseModel.GetPolyData())
-    clipper.Update()
-    cuttedPolyData = clipper.GetOutput()
-    self.leftPart.SetAndObservePolyData(cuttedPolyData)
+    planes.AddItem(upCoronalPlane)
+    planes.AddItem(lowerAxiaPlane)
+    planes.AddItem(outsideSagittalPlaneShifted)
+    cuttedPolyData = self.getClosedCuttedModel(planes, appendFilter.GetOutput())
+    appendFilterMiddle = vtk.vtkAppendPolyData()
+    appendFilterMiddle.AddInputData(cuttedPolyData)
+    appendFilterMiddle.AddInputData(cuttedPolyDataMiddle)
+    appendFilterMiddle.Update()
+    self.middlePart.SetAndObservePolyData(appendFilterMiddle.GetOutput())
 
-    clipper = vtk.vtkClipClosedSurface()
+    planes = vtk.vtkPlaneCollection()
+    planes.AddItem(outsideSagittalPlane)
+    cuttedPolyData = self.getClosedCuttedModel(planes, self.baseModel.GetPolyData())
+    self.rightPart.SetAndObservePolyData(cuttedPolyData)
+
     planes = vtk.vtkPlaneCollection()
     sagittalPlane = vtk.vtkPlane()
     sagittalPlane.SetOrigin(nasionPos[0], nasionPos[1], nasionPos[2])
     sagittalPlane.SetNormal(-math.cos(self.sagittalYawAngle), -math.sin(self.sagittalYawAngle), 0)
     planes.AddItem(sagittalPlane)
-    clipper.SetClippingPlanes(planes)
-    clipper.SetActivePlaneId(2)
-    clipper.SetInputData(self.baseModel.GetPolyData())
-    clipper.Update()
-    cuttedPolyData = clipper.GetOutput()
-    self.rightPart.SetAndObservePolyData(cuttedPolyData)
+    cuttedPolyData = self.getClosedCuttedModel(planes, self.baseModel.GetPolyData())
+    self.leftPart.SetAndObservePolyData(cuttedPolyData)
 
   def generateCubeModel(self, nasionNode, dimensions):
     cube = vtk.vtkCubeSource()
